@@ -11,10 +11,11 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
-
+import einops
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -94,6 +95,68 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+class ConvMlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., modulate_conv=False):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.modulate_conv = modulate_conv
+        if self.modulate_conv:
+            self.conv1_w = nn.Parameter(1, hidden_features, in_features, 3, 3)
+            self.demod = True
+        else:
+            self.conv1 = nn.Conv2d(in_features, hidden_features, kernel_size=3, stride=1, padding=1, bias=True)
+        self.act = act_layer()
+        self.conv2 = nn.Conv2d(hidden_features, out_features, kernel_size=3, stride=1, padding=1, bias=True)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, shift = None, scale = None):
+        h = w = int(math.sqrt(x.shape[1]))
+        x = einops.rearrange(x, 'b (h w) d -> b d h w', h=h)
+        if self.modulate_conv:
+            assert scale is not None, 'modulation tensor must be provided for modulated convolution'
+            x = self.conv_mod(x, scale) + shift.unsqueeze(1)
+        else:  
+            x = self.conv1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.conv2(x)
+        x = self.drop(x)
+        x = einops.rearrange(x, 'b d h w -> b (h w) d')
+        return x
+    
+
+    def conv_mod(
+        self,
+        fmap,
+        mod
+    ):
+        """
+        notation
+        b - batch
+        n - convs
+        o - output
+        i - input
+        k - kernel
+        """
+        b, h = fmap.shape[0], fmap.shape[-2]
+
+        weights = self.conv1_w
+        
+        # do the modulation, demodulation, as done in stylegan2
+        mod = einops.rearrange(mod, 'b i -> b 1 i 1 1')
+
+        weights = weights * (mod + 1)
+        if self.demod:
+            inv_norm = einops.reduce(weights ** 2, 'b o i k1 k2 -> b o 1 1 1', 'sum').clamp(min = self.eps).rsqrt()
+            weights = weights * inv_norm
+
+        fmap = einops.rearrange(fmap, 'b c h w -> 1 (b c) h w')
+        weights = einops.rearrange(weights, 'b o ... -> (b o) ...')
+        fmap = F.conv2d(fmap, weights, padding = 1, groups = b)
+        return einops.rearrange(fmap, '1 (b o) ... -> b o ...', b = b)
+
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
@@ -102,23 +165,63 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_skip_conv=False, use_mlp_conv=False, use_checkpoint=True, modulate_conv = False, **block_kwargs):
         super().__init__()
+        self.use_skip_conv=use_skip_conv
+        self.use_mlp_conv=use_mlp_conv
+        self.use_checkpoint = use_checkpoint
+        self.modulate_conv = modulate_conv
+
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
 
-    def forward(self, x, c):
+
+        if use_mlp_conv:
+            print("Using Conv MLP")
+            self.mlp = ConvMlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0, modulate_conv=modulate_conv)
+        else:
+            print("Using Linear MLP")
+            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+
+        self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            )
+        
+
+        if use_skip_conv:
+            self.skip = nn.Conv2d(hidden_size*2, hidden_size, kernel_size=3, stride=1, padding=1, bias=False)
+        else:
+            self.skip = nn.Linear(hidden_size*2, hidden_size, bias=False) 
+
+        
+    def forward(self, x, c, skip=None):
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, c, skip)
+        else:
+            return self._forward(x, c, skip)
+        
+    def _forward(self, x, c, skip=None):
+        if skip is not None:
+            if self.use_skip_conv:
+                x = torch.cat([x, skip], dim=-1)
+                B, L, D = x.shape
+                hw = int(math.sqrt(L))
+                x = einops.rearrange(x, 'b (h w) d -> b d h w', h=hw)
+                x = self.skip(x)
+                x = einops.rearrange(x, 'b d h w -> b (h w) d')
+            else:
+                x = self.skip(torch.cat([x, skip], dim=-1))
+    
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        if self.modulate_conv:
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(self.norm2(x), shift_mlp, scale_mlp)
+        else:
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -158,6 +261,10 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        use_skip_conv=False, 
+        use_mlp_conv=False, 
+        use_checkpoint=True, 
+        modulate_conv = False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -173,9 +280,16 @@ class DiT(nn.Module):
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        self.enc_blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_skip_conv=use_skip_conv, use_mlp_conv=use_mlp_conv, use_checkpoint=use_checkpoint, modulate_conv=modulate_conv) for _ in range(depth//2)
         ])
+
+        self.mid_block = DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,use_skip_conv=use_skip_conv, use_mlp_conv=use_mlp_conv, use_checkpoint=use_checkpoint, modulate_conv=modulate_conv)
+
+        self.dec_blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,use_skip_conv=use_skip_conv, use_mlp_conv=use_mlp_conv, use_checkpoint=use_checkpoint, modulate_conv=modulate_conv) for _ in range(depth//2)
+        ])
+
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -205,7 +319,14 @@ class DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
+        for block in self.enc_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.mid_block.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.mid_block.adaLN_modulation[-1].bias, 0)
+
+        for block in self.dec_blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
@@ -240,9 +361,18 @@ class DiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
-        for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+        c = t + y  
+        
+        skips = []
+        for block in self.enc_blocks:
+            x = block(x, c) 
+            skips.append(x)
+
+        x = self.mid_block(x, c, skip=skips[-1])
+
+        for block in self.dec_blocks:
+            x = block(x, c, skip=skips.pop())
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x

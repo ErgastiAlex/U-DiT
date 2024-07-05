@@ -26,7 +26,7 @@ from time import time
 import argparse
 import logging
 import os
-
+from torchvision.utils import save_image
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -130,7 +130,9 @@ def main(args):
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        results_dir = f"{experiment_dir}/results"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(results_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
@@ -141,12 +143,17 @@ def main(args):
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        use_skip_conv=args.use_skip_conv,
+        use_mlp_conv=args.use_mlp_conv, 
+        use_checkpoint=True,
+        modulate_conv = args.modulate_conv,
     )
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+    model = model.to(device)
+    print(model)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -171,7 +178,7 @@ def main(args):
     )
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
+        batch_size=args.global_batch_size,
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -181,7 +188,7 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -208,7 +215,7 @@ def main(args):
             opt.zero_grad()
             loss.backward()
             opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model)
 
             # Log loss values:
             running_loss += loss.item()
@@ -242,6 +249,32 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
+            if train_steps % args.sample_every == 0 and train_steps > 0:
+                with torch.no_grad():
+                    model.eval()
+                    class_labels = [0,1,2,0,1,2,0,1]
+
+                    # Create sampling noise:
+                    n = len(class_labels)
+                    z = torch.randn(n, 4, latent_size, latent_size, device=device)
+                    y = torch.tensor(class_labels, device=device)
+
+                    # Setup classifier-free guidance:
+                    z = torch.cat([z, z], 0)
+                    y_null = torch.tensor([args.num_classes] * n, device=device)
+                    y = torch.cat([y, y_null], 0)
+                    model_kwargs = dict(y=y, cfg_scale=4.0)
+
+                    # Sample images:
+                    samples = diffusion.p_sample_loop(
+                        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+                    )
+                    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+                    samples = vae.decode(samples / 0.18215).sample
+
+                    # Save and display images:
+                    save_image(samples, f"{results_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
+                    model.train()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -265,5 +298,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--sample-every", type=int, default=10_000)
+
+    parser.add_argument("--use-skip-conv", action="store_true")
+    parser.add_argument("--use-mlp-conv", action="store_true")
+    parser.add_argument("--modulate-conv", action="store_true")
+
+
     args = parser.parse_args()
     main(args)
